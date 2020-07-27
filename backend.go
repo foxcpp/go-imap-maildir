@@ -30,13 +30,25 @@ type Backend struct {
 	// map have vaild db.
 	//
 	// Lookup key is username + \0 + mailboxName.
-	dbs     map[string]mailboxHandle
+	dbs     map[string]*mailboxHandle
 	dbsLock sync.Mutex
 }
 
 type mailboxHandle struct {
-	db   *storm.DB
-	uses int64
+	db    *storm.DB
+	uses  int64
+	conns []backend.Conn
+
+	expunged chan uint32
+	created  chan uint32
+	flags    chan flagUpdate
+}
+
+type flagUpdate struct {
+	silentFor *Mailbox
+
+	uid      uint32
+	newFlags []string
 }
 
 func (b *Backend) Login(connInfo *imap.ConnInfo, username, password string) (backend.User, error) {
@@ -86,6 +98,10 @@ func (b *Backend) CreateUser(username string) error {
 	return nil
 }
 
+func (b *Backend) SetSubscribed(_ string, _ bool) error {
+	return nil /* No-op, all mailboxes are reported as subscribed */
+}
+
 func (b *Backend) Close() error {
 	b.dbsLock.Lock()
 	defer b.dbsLock.Unlock()
@@ -104,6 +120,6 @@ func New(pathTemplate string) (*Backend, error) {
 		Log:          log.New(os.Stderr, "imapmaildir: ", 0),
 		Debug:        log.New(ioutil.Discard, "imapmaildir[debug]: ", 0),
 		PathTemplate: pathTemplate,
-		dbs:          map[string]mailboxHandle{},
+		dbs:          map[string]*mailboxHandle{},
 	}, nil
 }

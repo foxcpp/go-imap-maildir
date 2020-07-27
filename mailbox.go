@@ -4,14 +4,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/asdine/storm/v3"
 	"github.com/emersion/go-imap"
+	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-imap/backend/backendutil"
 	"github.com/emersion/go-maildir"
 	"go.etcd.io/bbolt"
@@ -33,6 +36,14 @@ type Mailbox struct {
 	// Filesystem path to the mailbox directory. Not guaranteed to be absolute
 	// or relative.
 	path string
+
+	sharedHandle *mailboxHandle
+	thisConn     backend.Conn
+
+	uidMap             []uint32
+	pendingUIDs        []uint32
+	pendingFlags       []flagUpdate
+	stopUpdateHandling chan struct{}
 }
 
 type mboxData struct {
@@ -118,6 +129,11 @@ func (m *Mailbox) error(descr string, cause error, args ...interface{}) {
 }
 
 func (m *Mailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
+	_, status, err := m.status(items, false)
+	return status, err
+}
+
+func (m *Mailbox) status(items []imap.StatusItem, collectUids bool) ([]uint32, *imap.MailboxStatus, error) {
 	status := imap.NewMailboxStatus(m.name, items)
 
 	status.Flags = []string{
@@ -134,7 +150,7 @@ func (m *Mailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
 
 	if err := m.handle.One("Dummy", 1, &mboxMeta); err != nil {
 		m.error("Status: fetch mboxData", err)
-		return nil, errors.New("I/O error")
+		return nil, nil, errors.New("I/O error")
 	}
 
 	var (
@@ -157,11 +173,21 @@ func (m *Mailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
 		case imap.StatusUnseen:
 			needUnseen = true
 		default:
-			return nil, fmt.Errorf("unknown status item: %s", item)
+			return nil, nil, fmt.Errorf("unknown status item: %s", item)
 		}
 	}
 
-	q := m.handle.Select().OrderBy("UID")
+	var uids []uint32
+
+	if collectUids {
+		size := mboxMeta.MsgsCount
+		if size > 10000 {
+			size = 10000
+		}
+		uids = make([]uint32, 0, size)
+	}
+
+	q := m.handle.Select().OrderBy("UID").Limit(10000)
 	err := q.Each(new(message), func(rec interface{}) error {
 		msg := rec.(*message)
 		msgCounter++
@@ -169,13 +195,18 @@ func (m *Mailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
 			status.Unseen++
 		}
 		if status.UnseenSeqNum == 0 && msg.Unseen {
-			status.UnseenSeqNum = uint32(msgCounter + 1)
+			status.UnseenSeqNum = msgCounter + 1
 		}
+
+		if collectUids {
+			uids = append(uids, msg.UID)
+		}
+
 		return nil
 	})
 	if err != nil && err != storm.ErrNotFound {
 		m.error("Status", err)
-		return nil, errors.New("I/O error")
+		return nil, nil, errors.New("I/O error")
 	}
 	if needMsgCount {
 		status.Messages = msgCounter
@@ -194,73 +225,126 @@ func (m *Mailbox) Status(items []imap.StatusItem) (*imap.MailboxStatus, error) {
 		}
 	}
 
-	return status, nil
-}
-
-func (m *Mailbox) SetSubscribed(subscribed bool) error {
-	// No-op. Subscription status is not implemented.
-	return nil
+	return uids, status, nil
 }
 
 func (m *Mailbox) Check() error {
-	// No Check necessary as changes are coordinated via single Backend instance.
-	return nil
+	return m.synchronize(true, true)
 }
 
-func (m *Mailbox) contains(seq *imap.SeqSet, id uint32, last bool) bool {
-	if seq.Contains(id) {
-		return true
-	}
+func (m *Mailbox) Poll() error {
+	return m.synchronize(true, false)
+}
 
-	if seq.Dynamic() {
-		for _, s := range seq.Set {
-			if s.Stop == 0 && last {
-				return true
+func (m *Mailbox) synchronize(expunges, checkDB bool) error {
+	return m.handle.Bolt.Update(func(btx *bbolt.Tx) error {
+		tx := m.handle.WithTransaction(btx)
+
+		var mboxMeta mboxData
+		if err := tx.One("Dummy", 1, &mboxMeta); err != nil {
+			m.error("synchronize: fetch mboxData", err)
+			return errors.New("I/O error")
+		}
+
+		if expunges {
+			expunged := make([]uint32, 0, 16)
+			newMap := m.uidMap[:0]
+			for i, uid := range m.uidMap {
+				if uid == 0 {
+					expunged = append(expunged, uint32(i+1))
+				} else {
+					newMap = append(newMap, uid)
+				}
+			}
+			m.uidMap = newMap
+
+			for i := len(expunged) - 1; i >= 0; i-- {
+				m.thisConn.SendUpdate(&backend.ExpungeUpdate{
+					SeqNum: expunged[i],
+				})
 			}
 		}
-	}
-	return false
+
+		added := false
+		if checkDB {
+			var msgs []message
+			if err := tx.Range("UID", m.uidMap[len(m.uidMap)-1]+1, math.MaxUint32, &msgs, storm.Limit(1000)); err != nil {
+				m.error("synchronize: extra UID select failed (last UID = %v)", err, m.uidMap[len(m.uidMap)-1])
+				return nil
+			}
+			for _, msg := range msgs {
+				added = true
+				m.uidMap = append(m.uidMap, msg.UID)
+			}
+		} else {
+			added = len(m.pendingUIDs) != 0
+			m.uidMap = append(m.uidMap, m.pendingUIDs...)
+			m.pendingUIDs = m.pendingUIDs[:0]
+		}
+
+		if added {
+			status := imap.NewMailboxStatus("", []imap.StatusItem{imap.StatusMessages})
+			status.Messages = uint32(len(m.uidMap))
+			m.thisConn.SendUpdate(&backend.MailboxUpdate{
+				MailboxStatus: status,
+			})
+		}
+
+		for _, upd := range m.pendingFlags {
+			seq, ok := m.uidAsSeq(upd.uid)
+			if !ok {
+				m.error("synchronize: BUG: uidToSeq failed for resolved seqset (msg ID = %v)", nil, upd.uid)
+			}
+			updMsg := imap.NewMessage(seq, []imap.FetchItem{imap.FetchFlags})
+			updMsg.Flags = upd.newFlags
+			m.thisConn.SendUpdate(&backend.MessageUpdate{
+				Message: updMsg,
+			})
+		}
+		m.pendingFlags = m.pendingFlags[:0]
+
+		return nil
+	})
 }
 
 func (m *Mailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
 	defer close(ch)
 
-	var mboxMeta mboxData
-	if err := m.handle.One("Dummy", 1, &mboxMeta); err != nil {
-		m.error("list: I/O error for mboxMeta", err)
-		return errors.New("I/O error, try again later")
-	}
-
 	errored := false
+	hasResults := false
 
-	q := m.handle.Select().OrderBy("UID")
+	err := m.handle.Bolt.Update(func(btx *bbolt.Tx) error {
+		tx := m.handle.WithTransaction(btx)
 
-	maxSeqNum, err := q.Count(new(message))
-	if err != nil {
-		m.error("list: I/O error for mboxMeta", err)
-		return errors.New("I/O error, try again later")
-	}
-
-	var seqNum uint32
-	err = q.Each(new(message), func(rec interface{}) error {
-		msg := rec.(*message)
-		seqNum++
-
-		if uid && !m.contains(seqset, msg.UID, seqNum == uint32(maxSeqNum)) {
-			return nil
-		}
-		if !uid && !m.contains(seqset, seqNum, seqNum == uint32(maxSeqNum)) {
-			return nil
+		seqset, err := m.resolveSeqSet(uid, *seqset)
+		if err != nil {
+			return err
 		}
 
-		m.b.Debug.Println("ListMessages: fetching", items, "for", seqNum, msg.UID)
-		if err := m.fetch(ch, seqNum, *msg, items); err != nil {
-			m.error("fetch", err)
-			errored = true
-			return nil
-		}
+		return tx.Select().OrderBy("UID").Each(new(message), func(rec interface{}) error {
+			msg := rec.(*message)
 
-		return nil
+			if !seqset.Contains(msg.UID) {
+				return nil
+			}
+
+			seq, ok := m.uidAsSeq(msg.UID)
+			if !ok {
+				m.error("ListMessages: BUG: uidToSeq failed for resolved seqset (uid %v)", nil, msg.UID)
+				errored = true
+				return nil
+			}
+
+			m.b.Debug.Println("ListMessages: fetching", items, "for", msg.UID)
+			if err := m.fetch(ch, seq, *msg, items); err != nil {
+				m.error("fetch", err)
+				errored = true
+				return nil
+			}
+			hasResults = true
+
+			return nil
+		})
 	})
 	if err != nil {
 		if err == storm.ErrNotFound {
@@ -271,6 +355,12 @@ func (m *Mailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.Fetch
 		}
 		m.error("I/O error", err)
 		return err
+	}
+
+	m.synchronize(uid, false)
+
+	if !uid && !hasResults {
+		return errors.New("No messages matched")
 	}
 
 	if errored {
@@ -372,13 +462,16 @@ func (m *Mailbox) CreateMessage(flags []string, date time.Time, body imap.Litera
 			return fmt.Errorf("CreateMessage %d: load mboxData: %w", msg.UID, err)
 		}
 		mboxMeta.MsgsCount++
-		// TODO: Emit StatusUpdate (or was it MailboxUpdate?).
+		mboxMeta.UidNext = msg.UID + 1
 		if err := tx.Save(&mboxMeta); err != nil {
 			// TODO: Perhaps this should not fail and we can get away by having Status fix it?
 			return fmt.Errorf("CreateMessage %d: save mboxData: %w", msg.UID, err)
 		}
 
 		m.b.Debug.Printf("CreateMessage: written UID %d as maildir key %s to mbox %s/%s", msg.UID, msg.key(), m.username, m.name)
+		for range m.sharedHandle.conns {
+			m.sharedHandle.created <- msg.UID
+		}
 
 		return nil
 	})
@@ -388,36 +481,33 @@ func (m *Mailbox) CreateMessage(flags []string, date time.Time, body imap.Litera
 		return errors.New("I/O error, try again later")
 	}
 
+	m.synchronize(false, false)
+
 	return nil
 }
 
-func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation imap.FlagsOp, flags []string) error {
+func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation imap.FlagsOp, silent bool, flags []string) error {
 	var (
 		mFlags  messageFlags
 		errored = false
 	)
 
+	hasChanges := false
+
 	err := m.handle.Bolt.Update(func(btx *bbolt.Tx) error {
 		tx := m.handle.WithTransaction(btx)
 
-		q := tx.Select().OrderBy("UID")
-
-		maxSeqNum, err := q.Count(new(message))
+		seqset, err := m.resolveSeqSet(uid, *seqset)
 		if err != nil {
-			m.error("UpdateMessagesFlags: count", err)
 			return err
 		}
 
+		q := tx.Select().OrderBy("UID")
 		// TODO: Avoid iterating all messages for UID queries.
-		var seqNum uint32
 		return q.Each(new(message), func(rec interface{}) error {
 			msg := rec.(*message)
-			seqNum++
 
-			if uid && !m.contains(seqset, msg.UID, seqNum == uint32(maxSeqNum)) {
-				return nil
-			}
-			if !uid && !m.contains(seqset, seqNum, seqNum == uint32(maxSeqNum)) {
+			if !seqset.Contains(msg.UID) {
 				return nil
 			}
 
@@ -427,12 +517,40 @@ func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation i
 				return nil
 			}
 
-			m.b.Debug.Println("UpdateMessageFlags: updating flags", seqNum, msg.UID, mFlags.Flags, "op", operation, flags)
+			m.b.Debug.Println("UpdateMessageFlags: updating flags", msg.UID, mFlags.Flags, "op", operation, flags)
 			mFlags.Flags = backendutil.UpdateFlags(mFlags.Flags, operation, flags)
 			if err := tx.Save(&mFlags); err != nil {
 				m.error("UpdateMessagesFlags: save", err)
 				errored = true
 				return nil
+			}
+
+			hasSeen := false
+			hasDeleted := false
+			for _, f := range mFlags.Flags {
+				if f == imap.SeenFlag {
+					hasSeen = true
+				}
+				if f == imap.DeletedFlag {
+					hasDeleted = true
+				}
+			}
+			msg.Unseen = !hasSeen
+			msg.Deleted = hasDeleted
+			if err := tx.Save(&msg); err != nil {
+				m.error("UpdateMessagesFlags: save Unseen/Deleted flag failed", err)
+			}
+
+			hasChanges = true
+
+			upd := flagUpdate{
+				uid: msg.UID, newFlags: mFlags.Flags,
+			}
+			if silent {
+				upd.silentFor = m
+			}
+			for range m.sharedHandle.conns {
+				m.sharedHandle.flags <- upd
 			}
 
 			return nil
@@ -449,19 +567,25 @@ func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation i
 		return err
 	}
 
+	if !uid && !hasChanges {
+		return errors.New("No messages matched")
+	}
+
+	m.synchronize(uid, false)
+
 	if errored {
 		return errors.New("Server-side occured, only some messages affected")
 	}
 	return nil
 }
 
-func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error {
+func (m *Mailbox) CopyMessages(uid bool, seqsetRaw *imap.SeqSet, dest string) error {
 	u, err := m.b.GetUser(m.username)
 	if err != nil {
 		m.error("", err)
 		return err
 	}
-	tgtMboxI, err := u.GetMailbox(dest)
+	_, tgtMboxI, err := u.GetMailbox(dest, true, nil)
 	if err != nil {
 		return err
 	}
@@ -481,6 +605,11 @@ func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error
 	txSrc := m.handle.WithTransaction(srcTx)
 	defer txSrc.Rollback()
 
+	seqset, err := m.resolveSeqSet(uid, *seqsetRaw)
+	if err != nil {
+		return err
+	}
+
 	// Files that should be removed on transaction error.
 	var purgeList []string
 	rollbackFiles := func() {
@@ -491,19 +620,13 @@ func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error
 		}
 	}
 
+	var newTgtUids []uint32
+
 	// TODO: Avoid iterating all messages for UID queries.
 	q := txSrc.Select().OrderBy("UID")
 
-	maxSeqNum, err := q.Count(new(message))
-	if err != nil {
-		m.error("UpdateMessagesFlags: count", err)
-		return err
-	}
-
-	var seqNum uint32
 	err = q.Each(new(message), func(rec interface{}) error {
 		msg := rec.(*message)
-		seqNum++
 		// srcName already includes directory.
 		srcName, err := m.dir.Filename(msg.key())
 		if err != nil {
@@ -518,10 +641,7 @@ func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error
 			return fmt.Errorf("CopyMessages %d (src UID): filename error: %w", msg.UID, err)
 		}
 
-		if uid && !m.contains(seqset, msg.UID, seqNum == uint32(maxSeqNum)) {
-			return nil
-		}
-		if !uid && !m.contains(seqset, seqNum, seqNum == uint32(maxSeqNum)) {
+		if !seqset.Contains(msg.UID) {
 			return nil
 		}
 
@@ -570,6 +690,8 @@ func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error
 		}
 		purgeList = append(purgeList, tgtName)
 
+		newTgtUids = append(newTgtUids, msg.UID)
+
 		return nil
 	})
 	if err != nil {
@@ -599,6 +721,12 @@ func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error
 		return errors.New("I/O error, try again later")
 	}
 
+	for range tgtMbox.sharedHandle.conns {
+		for _, uid := range newTgtUids {
+			tgtMbox.sharedHandle.created <- uid
+		}
+	}
+
 	if err := txTgt.Commit(); err != nil {
 		m.error("CopyMessages tgt: commit", err)
 		rollbackFiles()
@@ -610,46 +738,66 @@ func (m *Mailbox) CopyMessages(uid bool, seqset *imap.SeqSet, dest string) error
 		return errors.New("I/O error, try again later")
 	}
 
+	if len(newTgtUids) == 0 && !uid {
+		return errors.New("No messages matched")
+	}
+
+	m.synchronize(uid, false)
+
 	return nil
 }
 
 func (m *Mailbox) Expunge() error {
-	var msgs []message
-	if err := m.handle.AllByIndex("UID", &msgs); err != nil {
-		m.error("I/O error", err)
-		return errors.New("I/O error")
-	}
-
 	errored := false
 
-	for _, msg := range msgs {
+	err := m.handle.Select().OrderBy("UID").Each(new(message), func(rec interface{}) error {
+		msg := rec.(*message)
 		if !msg.Deleted {
-			continue
+			return nil
+		}
+
+		seq := sort.Search(len(m.uidMap), func(i int) bool {
+			return m.uidMap[i] >= msg.UID
+		})
+		if seq >= len(m.uidMap) || m.uidMap[seq] != msg.UID {
+			// We should remove only messages that are known to this connection.
+			return nil
 		}
 
 		if err := m.dir.Remove(msg.key()); err != nil {
 			errored = true
 			m.error("I/O error", err)
-			continue
+			return nil
 		}
 		if err := m.handle.DeleteStruct(&msg); err != nil {
 			errored = true
 			m.error("I/O error", err)
-			continue
+			return nil
 		}
 
 		if err := m.handle.Delete("messageInfo", msg.UID); err != nil {
 			errored = true
 			m.error("I/O error", err)
-			continue
+			return nil
 		}
 		if err := m.handle.Delete("messageCache", msg.UID); err != nil {
 			errored = true
 			m.error("I/O error", err)
-			continue
+			return nil
 		}
+
+		for range m.sharedHandle.conns {
+			m.sharedHandle.expunged <- msg.UID
+		}
+
+		return nil
+	})
+	if err != nil {
+		m.error("I/O error", err)
+		return errors.New("I/O error")
 	}
-	// TODO: Emit accumulated ExpungeUpdate.
+
+	m.synchronize(true, false)
 
 	if errored {
 		return errors.New("I/O error occured during expunge operation, not all messages are removed")
@@ -658,10 +806,6 @@ func (m *Mailbox) Expunge() error {
 }
 
 func (m *Mailbox) Close() error {
-	// XXX: This function is currently not called by go-imap.
-	// https://github.com/emersion/go-imap/pull/341
-	// Mailbox handles __WILL__ leak.
-
 	if m.handle == nil {
 		return nil
 	}
@@ -674,15 +818,36 @@ func (m *Mailbox) Close() error {
 	handle := m.b.dbs[key]
 	handle.uses--
 
+	m.b.Debug.Printf("mailbox %s/%s: session ended", m.username, m.name)
+
+	// XXX: Race with iteration for updates.
+	if m.thisConn != nil {
+		foundIndx := -1
+		for i, c := range handle.conns {
+			if c == m.thisConn {
+				foundIndx = i
+			}
+		}
+		if foundIndx != -1 {
+			copy(handle.conns[foundIndx:], handle.conns[foundIndx+1:])
+			handle.conns[len(handle.conns)-1] = nil
+			handle.conns = handle.conns[:len(handle.conns)-1]
+			m.b.Debug.Printf("mailbox %s/%s: unregistered handle", m.username, m.name)
+		} else {
+			m.b.Debug.Printf("mailbox %s/%s: BUG: handle for connection was not registered", m.username, m.name)
+		}
+	}
+
 	// Some sanity checks.
 	if handle.uses < 0 {
 		m.error("mailbox %s/%s: BUG: BoltDB reference counter went negative for", nil)
 	}
 	if handle.db != m.handle {
-		m.error("mailbox %s/%s: BUG: multiple database handles created", nil)
+		m.error("mailbox %s/%s: BUG: multiple database handles created", nil, m.username, m.name)
 	}
 
 	if handle.uses <= 0 {
+		m.b.Debug.Printf("mailbox %s/%s: freeing handle", m.username, m.name)
 		delete(m.b.dbs, key)
 		if err := m.handle.Close(); err != nil {
 			m.error("close failed: %v", err)
@@ -693,4 +858,153 @@ func (m *Mailbox) Close() error {
 
 	m.b.dbs[key] = handle
 	return nil
+}
+
+var uselessSeq = imap.Seq{
+	Start: math.MaxUint32,
+	Stop:  math.MaxUint32,
+}
+
+func uidToSeq(uidMap []uint32, seq imap.Seq) (imap.Seq, error) {
+	if len(uidMap) == 0 {
+		return uselessSeq, errors.New("No messages matched")
+	}
+
+	initial := seq
+
+	if seq.Start == 0 {
+		seq.Start = uint32(len(uidMap))
+	} else if seq.Start > uidMap[len(uidMap)-1] {
+		return uselessSeq, errors.New("No messages matched")
+	} else if seq.Start < uidMap[0] {
+		seq.Start = 1
+	} else {
+		seq.Start = uint32(sort.Search(len(uidMap), func(i int) bool {
+			return uidMap[i] >= seq.Start
+		})) + 1
+	}
+
+	if seq.Start == math.MaxUint32 {
+		return uselessSeq, errors.New("No messages matched")
+	}
+
+	if seq.Stop == 0 || seq.Stop > uidMap[len(uidMap)-1] {
+		seq.Stop = uint32(len(uidMap))
+	} else if seq.Stop < uidMap[0] {
+		return uselessSeq, errors.New("No messages matched")
+	} else {
+		if initial.Start == initial.Stop {
+			return imap.Seq{Start: seq.Start, Stop: seq.Start}, nil
+		}
+
+		seq.Stop = uint32(sort.Search(len(uidMap), func(i int) bool {
+			return uidMap[i] >= seq.Stop
+		})) + 1
+		if seq.Stop > uint32(len(uidMap)) || uidMap[seq.Stop-1] != initial.Stop {
+			seq.Stop -= 1
+		}
+	}
+
+	if seq.Start > seq.Stop || seq.Stop == math.MaxUint32 {
+		return uselessSeq, errors.New("No messages matched")
+	}
+
+	return seq, nil
+}
+
+func seqToUid(uidMap []uint32, seq imap.Seq) (imap.Seq, error) {
+	if len(uidMap) == 0 {
+		return uselessSeq, errors.New("No messages matched")
+	}
+
+	initial := seq
+	start, stop := seq.Start, seq.Stop
+
+	for {
+		if start == 0 {
+			seq.Start = uidMap[len(uidMap)-1]
+		} else if start > uint32(len(uidMap)) {
+			return uselessSeq, errors.New("No messages matched")
+		} else {
+			seq.Start = uidMap[start-1]
+		}
+
+		if seq.Start != 0 {
+			break
+		}
+		start++
+
+		if initial.Start == initial.Stop {
+			return uselessSeq, errors.New("No messages matched")
+		}
+	}
+
+	if initial.Start == initial.Stop {
+		return imap.Seq{Start: seq.Start, Stop: seq.Start}, nil
+	}
+
+	for {
+		if stop == 0 || stop > uint32(len(uidMap)) {
+			seq.Stop = uidMap[len(uidMap)-1]
+		} else {
+			seq.Stop = uidMap[stop-1]
+		}
+
+		if seq.Stop != 0 {
+			break
+		}
+		stop--
+		if stop == 0 {
+			return uselessSeq, errors.New("No messages matched")
+		}
+	}
+
+	return seq, nil
+}
+
+func (m *Mailbox) resolveSeqSet(uid bool, set imap.SeqSet) (imap.SeqSet, error) {
+	if uid {
+		return set, nil
+	}
+
+	result := imap.SeqSet{}
+	for _, seq := range set.Set {
+		seq, err := seqToUid(m.uidMap, seq)
+		if err != nil {
+			return imap.SeqSet{}, err
+		}
+		result.AddRange(seq.Start, seq.Stop)
+	}
+	return result, nil
+}
+
+func (m *Mailbox) uidAsSeq(uid uint32) (uint32, bool) {
+	seq, err := uidToSeq(m.uidMap, imap.Seq{uid, uid})
+	return seq.Start, err == nil
+}
+
+func (m *Mailbox) backgroundUpdates() {
+	for {
+		select {
+		case <-m.stopUpdateHandling:
+			return
+		case msgID := <-m.sharedHandle.expunged:
+			seq, ok := m.uidAsSeq(msgID)
+			if !ok {
+				m.error("backgroundUpdates: failed to translate msgID to sequence (msg ID = %v)", nil, msgID)
+				continue
+			}
+			m.b.Debug.Printf("backgroundUpdates: updated sequence map for mbox instance %p", m)
+			m.uidMap[seq] = 0
+		case msgID := <-m.sharedHandle.created:
+			m.b.Debug.Printf("backgroundUpdates: received new message ID: %v", msgID)
+			m.pendingUIDs = append(m.pendingUIDs, msgID)
+		case update := <-m.sharedHandle.flags:
+			if update.silentFor == m {
+				continue
+			}
+			m.b.Debug.Printf("backgroundUpdates: received updated flags for msgID %v: %v", update.uid, update.newFlags)
+			m.pendingFlags = append(m.pendingFlags, update)
+		}
+	}
 }

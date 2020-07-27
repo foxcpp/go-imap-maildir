@@ -13,4 +13,5 @@ require (
 	golang.org/x/sys v0.0.0-20200223170610-d5e6a3e2c0ae // indirect
 )
 
-replace github.com/foxcpp/go-imap-backend-tests => ../go-imap-backend-tests/
+replace github.com/foxcpp/go-imap-backend-tests => ../go-imap-backend-tests
+replace github.com/emersion/go-imap => github.com/foxcpp/go-imap v1.0.0-beta.1.0.20200726203712-b88370e55f2f

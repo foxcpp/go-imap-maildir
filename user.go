@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/asdine/storm/v3"
+	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-maildir"
 	"go.etcd.io/bbolt"
@@ -18,6 +19,8 @@ const (
 	InboxName      = "INBOX"
 	HierarchySep   = "."
 	MaxMboxNesting = 100
+
+	MaxConnsPerMbox = 20
 
 	IndexFile = "imapmaildir-index.db"
 )
@@ -46,6 +49,19 @@ type User struct {
 
 	name     string
 	basePath string
+}
+
+func (u *User) SetSubscribed(_ string, _ bool) error {
+	return nil /* TODO */
+}
+
+func (u *User) Status(name string, items []imap.StatusItem) (*imap.MailboxStatus, error) {
+	_, mbox, err := u.GetMailbox(name, true, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer mbox.Close()
+	return mbox.(*Mailbox).Status(items)
 }
 
 func (u *User) prepareMboxPath(mbox string) (fsPath string, parts []string, err error) {
@@ -106,15 +122,16 @@ func (u *User) Username() string {
 	return u.name
 }
 
-func (u *User) ListMailboxes(subscribed bool) ([]backend.Mailbox, error) {
+func (u *User) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
 	// TODO: Figure out a fast way to filter subscribed/unsubscribed
 	// directories.
 
-	mboxes := []backend.Mailbox{
-		&Mailbox{
+	mboxes := []imap.MailboxInfo{
+		{
 			// Inbox always exists.
-			name: InboxName,
-			path: u.basePath,
+			Name:       InboxName,
+			Attributes: nil,
+			Delimiter:  HierarchySep,
 		},
 	}
 
@@ -146,11 +163,10 @@ func (u *User) ListMailboxes(subscribed bool) ([]backend.Mailbox, error) {
 		u.b.Debug.Printf("listing mbox (%v, %v)", mboxName, path)
 
 		// Note that Mailbox object has nil handle.
-		mboxes = append(mboxes, &Mailbox{
-			b:        u.b,
-			username: u.name,
-			name:     mboxName,
-			path:     path,
+		mboxes = append(mboxes, imap.MailboxInfo{
+			Name:       mboxName,
+			Attributes: nil,
+			Delimiter:  HierarchySep,
 		})
 		return nil
 	})
@@ -162,7 +178,7 @@ func (u *User) ListMailboxes(subscribed bool) ([]backend.Mailbox, error) {
 	return mboxes, nil
 }
 
-func (u *User) openDB(fsPath, mbox string) (*storm.DB, error) {
+func (u *User) openDB(fsPath, mbox string) (*mailboxHandle, error) {
 	u.b.dbsLock.Lock()
 	defer u.b.dbsLock.Unlock()
 
@@ -172,8 +188,7 @@ func (u *User) openDB(fsPath, mbox string) (*storm.DB, error) {
 		handle.uses++
 		u.b.Debug.Printf("%d uses for %s/%s mbox", handle.uses, u.name, mbox)
 		u.b.dbs[key] = handle
-		db := handle.db
-		return db, nil
+		return handle, nil
 	}
 
 	db, err := storm.Open(filepath.Join(fsPath, IndexFile))
@@ -181,36 +196,39 @@ func (u *User) openDB(fsPath, mbox string) (*storm.DB, error) {
 		return nil, err
 	}
 
-	u.b.dbs[key] = mailboxHandle{
-		uses: 1,
-		db:   db,
+	u.b.dbs[key] = &mailboxHandle{
+		uses:     1,
+		db:       db,
+		expunged: make(chan uint32),
+		created:  make(chan uint32),
+		flags:    make(chan flagUpdate, MaxConnsPerMbox),
 	}
 
-	return db, nil
+	return u.b.dbs[key], nil
 }
 
-func (u *User) GetMailbox(mbox string) (backend.Mailbox, error) {
+func (u *User) GetMailbox(mbox string, readOnly bool, conn backend.Conn) (*imap.MailboxStatus, backend.Mailbox, error) {
 	fsPath, _, err := u.prepareMboxPath(mbox)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	_, err = os.Stat(fsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, backend.ErrNoSuchMailbox
+			return nil, nil, backend.ErrNoSuchMailbox
 		}
 		u.b.Log.Printf("failed to get mailbox: %v", err)
-		return nil, errors.New("I/O error")
+		return nil, nil, errors.New("I/O error")
 	}
 
 	handle, err := u.openDB(fsPath, mbox)
 	if err != nil {
 		u.b.Log.Printf("failed to open DB: %v", err)
-		return nil, errors.New("I/O error, try again more")
+		return nil, nil, errors.New("I/O error, try again more")
 	}
-	err = handle.Bolt.Update(func(btx *bbolt.Tx) error {
-		tx := handle.WithTransaction(btx)
+	err = handle.db.Bolt.Update(func(btx *bbolt.Tx) error {
+		tx := handle.db.WithTransaction(btx)
 		var data mboxData
 		err := tx.One("Dummy", 1, &data)
 		if err == nil {
@@ -230,20 +248,45 @@ func (u *User) GetMailbox(mbox string) (backend.Mailbox, error) {
 		return nil
 	})
 	if err != nil {
-		handle.Close()
+		handle.db.Close()
 		u.b.Log.Printf("failed to init DB: %v", err)
-		return nil, errors.New("I/O error, try again later")
+		return nil, nil, errors.New("I/O error, try again later")
 	}
 
 	u.b.Debug.Printf("get mbox (%v, %v)", mbox, fsPath)
-	return &Mailbox{
-		b:        u.b,
-		name:     mbox,
-		username: u.name,
-		handle:   handle,
-		dir:      maildir.Dir(fsPath),
-		path:     fsPath,
-	}, nil
+	mboxHandle := &Mailbox{
+		b:                  u.b,
+		name:               mbox,
+		username:           u.name,
+		handle:             handle.db,
+		dir:                maildir.Dir(fsPath),
+		path:               fsPath,
+		thisConn:           conn,
+		sharedHandle:       handle,
+		stopUpdateHandling: make(chan struct{}),
+	}
+
+	if conn == nil {
+		return nil, mboxHandle, nil
+	}
+
+	uidMap, status, err := mboxHandle.status([]imap.StatusItem{imap.StatusMessages, imap.StatusRecent,
+		imap.StatusUnseen, imap.StatusUidNext, imap.StatusUidValidity}, true)
+	if err != nil {
+		return nil, mboxHandle, err
+	}
+
+	handle.conns = append(handle.conns, conn)
+	go mboxHandle.backgroundUpdates()
+
+	mboxHandle.uidMap = uidMap
+	if len(uidMap) != 0 {
+		u.b.Debug.Printf("populated mailbox %s uidMap (len = %v, first = %v, last = %v)", mbox, len(uidMap), uidMap[0], uidMap[len(uidMap)-1])
+	} else {
+		u.b.Debug.Printf("empty mailbox %s uidMap", mbox)
+	}
+
+	return status, mboxHandle, nil
 }
 
 func (u *User) CreateMailbox(mbox string) error {
@@ -367,4 +410,12 @@ func (u *User) RenameMailbox(existingName, newName string) error {
 func (u *User) Logout() error {
 	u.b.Debug.Printf("user logged out (%v, %v)", u.name, u.basePath)
 	return nil
+}
+
+func (u *User) CreateMessage(mboxName string, flags []string, date time.Time, body imap.Literal) error {
+	_, mbox, err := u.GetMailbox(mboxName, false, nil)
+	if err != nil {
+		return err
+	}
+	return mbox.(*Mailbox).CreateMessage(flags, date, body)
 }

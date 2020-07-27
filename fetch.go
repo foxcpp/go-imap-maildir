@@ -211,7 +211,6 @@ func (m *Mailbox) sanityCheckFlags(msg *message, flags []string) {
 	var (
 		hasSeen    = false
 		hasDeleted = false
-		mismatch   = false
 	)
 	for _, f := range flags {
 		if f == imap.DeletedFlag {
@@ -223,18 +222,8 @@ func (m *Mailbox) sanityCheckFlags(msg *message, flags []string) {
 	}
 	if hasSeen != !msg.Unseen {
 		m.error("BUG: message-messageFlags mismatch, flags: %v, message: %+v", nil, flags, msg)
-		mismatch = true
 	}
 	if hasDeleted != msg.Deleted {
 		m.error("BUG: message-messageFlags mismatch, flags: %v, message: %+v", nil, flags, msg)
-		mismatch = true
-	}
-
-	if mismatch {
-		msg.Deleted = hasDeleted
-		msg.Unseen = !hasSeen
-		if err := m.handle.Save(msg); err != nil {
-			m.error("I/O error", err)
-		}
 	}
 }
