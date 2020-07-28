@@ -689,11 +689,9 @@ func (m *Mailbox) CopyMessages(uid bool, seqsetRaw *imap.SeqSet, dest string) er
 	}
 
 	for _, box := range tgtMbox.sharedHandle.mboxes {
-		for _, uid := range newTgtUids {
-			box.viewLock.Lock()
-			box.pendingUIDs = append(m.pendingUIDs, uid)
-			box.viewLock.Unlock()
-		}
+		box.viewLock.Lock()
+		box.pendingUIDs = append(m.pendingUIDs, newTgtUids...)
+		box.viewLock.Unlock()
 	}
 
 	if err := txTgt.Commit(); err != nil {
@@ -705,10 +703,6 @@ func (m *Mailbox) CopyMessages(uid bool, seqsetRaw *imap.SeqSet, dest string) er
 		m.error("CopyMessages: commit src", err)
 		rollbackFiles()
 		return errors.New("I/O error, try again later")
-	}
-
-	if len(newTgtUids) == 0 && !uid {
-		return errors.New("No messages matched")
 	}
 
 	m.synchronize(true)

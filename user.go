@@ -3,6 +3,7 @@ package imapmaildir
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,8 +52,23 @@ type User struct {
 	basePath string
 }
 
-func (u *User) SetSubscribed(_ string, _ bool) error {
-	return nil /* TODO */
+func (u *User) SetSubscribed(mbox string, subscribed bool) error {
+	fsPath, _, err := u.prepareMboxPath(mbox)
+	if err != nil {
+		return err
+	}
+	if !subscribed {
+		err = ioutil.WriteFile(filepath.Join(fsPath, "unsubscribed"), []byte{}, os.ModePerm)
+		if os.IsNotExist(err) {
+			return backend.ErrNoSuchMailbox
+		}
+	} else {
+		err = os.Remove(filepath.Join(fsPath, "unsubscribed"))
+		if err != nil && !os.IsNotExist(err) {
+			return errors.New("I/O error, try again later")
+		}
+	}
+	return nil
 }
 
 func (u *User) Status(name string, items []imap.StatusItem) (*imap.MailboxStatus, error) {
@@ -127,9 +143,6 @@ func (u *User) Username() string {
 }
 
 func (u *User) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
-	// TODO: Figure out a fast way to filter subscribed/unsubscribed
-	// directories.
-
 	mboxes := []imap.MailboxInfo{
 		{
 			// Inbox always exists.
@@ -137,6 +150,11 @@ func (u *User) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
 			Attributes: nil,
 			Delimiter:  HierarchySep,
 		},
+	}
+
+	_, inboxSub := os.Stat(filepath.Join(u.basePath, "subscribed"))
+	if inboxSub != nil && subscribed {
+		mboxes = []imap.MailboxInfo{}
 	}
 
 	err := filepath.Walk(u.basePath, func(path string, info os.FileInfo, err error) error {
@@ -156,6 +174,13 @@ func (u *User) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
 
 		if !strings.HasPrefix(info.Name(), ".") {
 			return filepath.SkipDir
+		}
+
+		if subscribed {
+			_, err := os.Stat(filepath.Join(path, "unsubscribed"))
+			if err == nil {
+				return filepath.SkipDir
+			}
 		}
 
 		mboxName, err := u.mboxName(path)
