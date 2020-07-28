@@ -84,6 +84,10 @@ func (u *User) prepareMboxPath(mbox string) (fsPath string, parts []string, err 
 			}
 			continue
 		}
+		// If mailbox path starts with INBOX. - skip that level.
+		if i == 0 && strings.EqualFold(part, InboxName) {
+			continue
+		}
 
 		if !validMboxPart(part) {
 			u.b.Log.Printf("illegal mailbox name requested by %s: %v", u.name, mbox)
@@ -197,11 +201,8 @@ func (u *User) openDB(fsPath, mbox string) (*mailboxHandle, error) {
 	}
 
 	u.b.dbs[key] = &mailboxHandle{
-		uses:     1,
-		db:       db,
-		expunged: make(chan uint32),
-		created:  make(chan uint32),
-		flags:    make(chan flagUpdate, MaxConnsPerMbox),
+		uses: 1,
+		db:   db,
 	}
 
 	return u.b.dbs[key], nil
@@ -255,15 +256,14 @@ func (u *User) GetMailbox(mbox string, readOnly bool, conn backend.Conn) (*imap.
 
 	u.b.Debug.Printf("get mbox (%v, %v)", mbox, fsPath)
 	mboxHandle := &Mailbox{
-		b:                  u.b,
-		name:               mbox,
-		username:           u.name,
-		handle:             handle.db,
-		dir:                maildir.Dir(fsPath),
-		path:               fsPath,
-		thisConn:           conn,
-		sharedHandle:       handle,
-		stopUpdateHandling: make(chan struct{}),
+		b:            u.b,
+		name:         mbox,
+		username:     u.name,
+		handle:       handle.db,
+		dir:          maildir.Dir(fsPath),
+		path:         fsPath,
+		thisConn:     conn,
+		sharedHandle: handle,
 	}
 
 	if conn == nil {
@@ -276,8 +276,7 @@ func (u *User) GetMailbox(mbox string, readOnly bool, conn backend.Conn) (*imap.
 		return nil, mboxHandle, err
 	}
 
-	handle.conns = append(handle.conns, conn)
-	go mboxHandle.backgroundUpdates()
+	handle.mboxes = append(handle.mboxes, mboxHandle)
 
 	mboxHandle.uidMap = uidMap
 	if len(uidMap) != 0 {
@@ -379,6 +378,15 @@ func (u *User) DeleteMailbox(mbox string) error {
 		}
 	}
 
+	// TODO: Do we want to preserve child mailboxes and follow RFC 3501
+	// exactly here?
+	if err := os.RemoveAll(fsPath); err != nil {
+		if !os.IsNotExist(err) {
+			u.b.Log.Printf("failed to remove mailbox: %v", err)
+			return errors.New("I/O error")
+		}
+	}
+
 	u.b.Debug.Printf("delete mbox (%v, %v)", mbox, fsPath)
 
 	return nil
@@ -386,8 +394,41 @@ func (u *User) DeleteMailbox(mbox string) error {
 
 func (u *User) RenameMailbox(existingName, newName string) error {
 	if strings.EqualFold(existingName, InboxName) {
-		// TODO: Handle special case of INBOX move.
-		return errors.New("not implemented")
+		fsPathNew, _, err := u.prepareMboxPath(newName)
+		if err != nil {
+			return err
+		}
+
+		if _, err := os.Stat(fsPathNew); err != nil {
+			if !os.IsNotExist(err) {
+				u.b.Debug.Printf("failed to create mailbox: %v", err)
+				return errors.New("I/O error")
+			}
+		} else {
+			return backend.ErrMailboxAlreadyExists
+		}
+
+		if err := os.MkdirAll(fsPathNew, 0700); err != nil {
+			u.b.Debug.Printf("failed to create mailbox: %v", err)
+			return errors.New("I/O error")
+		}
+
+		if err := os.Rename(filepath.Join(u.basePath, "cur"), filepath.Join(fsPathNew, "cur")); err != nil {
+			u.b.Log.Printf("failed to rename mailbox: %v", err)
+			return errors.New("I/O error")
+		}
+		if err := os.Rename(filepath.Join(u.basePath, "new"), filepath.Join(fsPathNew, "new")); err != nil {
+			u.b.Log.Printf("failed to rename mailbox: %v", err)
+			return errors.New("I/O error")
+		}
+		if err := os.Rename(filepath.Join(u.basePath, "tmp"), filepath.Join(fsPathNew, "tmp")); err != nil {
+			u.b.Log.Printf("failed to rename mailbox: %v", err)
+			return errors.New("I/O error")
+		}
+		// Index for INBOX might be uninitialized if it was never opened.
+		_ = os.Rename(filepath.Join(u.basePath, IndexFile), filepath.Join(fsPathNew, IndexFile))
+
+		return nil
 	}
 
 	fsPathOld, _, err := u.prepareMboxPath(existingName)
@@ -417,5 +458,6 @@ func (u *User) CreateMessage(mboxName string, flags []string, date time.Time, bo
 	if err != nil {
 		return err
 	}
+	defer mbox.Close()
 	return mbox.(*Mailbox).CreateMessage(flags, date, body)
 }

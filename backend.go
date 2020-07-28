@@ -5,6 +5,7 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -35,13 +36,9 @@ type Backend struct {
 }
 
 type mailboxHandle struct {
-	db    *storm.DB
-	uses  int64
-	conns []backend.Conn
-
-	expunged chan uint32
-	created  chan uint32
-	flags    chan flagUpdate
+	db     *storm.DB
+	uses   int64
+	mboxes []*Mailbox
 }
 
 type flagUpdate struct {
@@ -95,6 +92,20 @@ func (b *Backend) CreateUser(username string) error {
 		}
 		return err
 	}
+
+	err = os.Mkdir(filepath.Join(basePath, "cur"), 0700)
+	if err != nil {
+		return errors.New("I/O error")
+	}
+	err = os.Mkdir(filepath.Join(basePath, "new"), 0700)
+	if err != nil {
+		return errors.New("I/O error")
+	}
+	err = os.Mkdir(filepath.Join(basePath, "tmp"), 0700)
+	if err != nil {
+		return errors.New("I/O error")
+	}
+
 	return nil
 }
 
