@@ -18,11 +18,13 @@ import (
 	"github.com/emersion/go-imap/backend"
 	"github.com/emersion/go-imap/backend/backendutil"
 	"github.com/emersion/go-maildir"
+	gomessage "github.com/emersion/go-message"
 	"go.etcd.io/bbolt"
 )
 
 type Mailbox struct {
-	b *Backend
+	b    *Backend
+	user *User
 
 	// DB handle, see dbs comment in Backend - it may be not only ours handle.
 	// Also it is nil for Mailbox'es created by ListMailboxes.
@@ -54,6 +56,8 @@ type mboxData struct {
 	UidValidity uint32
 	UidNext     uint32
 	MsgsCount   uint32
+
+	UsedFlags map[string]int
 }
 
 type message struct {
@@ -144,15 +148,21 @@ func (m *Mailbox) status(items []imap.StatusItem, collectUids bool) ([]uint32, *
 	}
 	status.PermanentFlags = []string{
 		imap.SeenFlag, imap.AnsweredFlag, imap.FlaggedFlag,
-		imap.DeletedFlag, imap.DraftFlag,
+		imap.DeletedFlag, imap.DraftFlag, `\*`,
 	}
-	// TODO: Report used flags (cache them?)
 
 	var mboxMeta mboxData
 
 	if err := m.handle.One("Dummy", 1, &mboxMeta); err != nil {
 		m.error("Status: fetch mboxData", err)
 		return nil, nil, errors.New("I/O error")
+	}
+
+	for f, uses := range mboxMeta.UsedFlags {
+		if uses > 0 {
+			status.Flags = append(status.Flags, f)
+			status.PermanentFlags = append(status.PermanentFlags, f)
+		}
 	}
 
 	var (
@@ -244,7 +254,7 @@ func (m *Mailbox) synchronize(expunges bool) {
 		newMap := m.uidMap[:0]
 		for i, uid := range m.uidMap {
 			if uid == 0 {
-				m.b.Debug.Printf("synchronize: sending expunge for seq=%v,uid=%v for mbox %v", i, uid, m.name)
+				m.b.Debug.Printf("synchronize: sending expunge for seq=%v for mbox %v", i+1, m.name)
 				expunged = append(expunged, uint32(i+1))
 			} else {
 				newMap = append(newMap, uid)
@@ -263,7 +273,7 @@ func (m *Mailbox) synchronize(expunges bool) {
 	if len(m.pendingUIDs) != 0 {
 		m.b.Debug.Printf("synchronize: updated uid map from pending list: %v", m.pendingUIDs)
 		m.uidMap = append(m.uidMap, m.pendingUIDs...)
-		m.pendingUIDs = m.pendingUIDs[:0]
+		m.pendingUIDs = nil
 
 		m.b.Debug.Printf("synchronize: now %d messages in uid map", len(m.uidMap))
 		status := imap.NewMailboxStatus("", []imap.StatusItem{imap.StatusMessages})
@@ -274,6 +284,10 @@ func (m *Mailbox) synchronize(expunges bool) {
 	}
 
 	for _, upd := range m.pendingFlags {
+		if upd.silentFor == m {
+			continue
+		}
+
 		seq, ok := uidToSeq(m.uidMap, imap.Seq{Start: upd.uid, Stop: upd.uid})
 		if !ok {
 			m.error("synchronize: BUG: uidToSeq failed for resolved seqset (msg ID = %v)", nil, upd.uid)
@@ -285,54 +299,96 @@ func (m *Mailbox) synchronize(expunges bool) {
 			Message: updMsg,
 		})
 	}
-	m.pendingFlags = m.pendingFlags[:0]
+	m.pendingFlags = nil
 }
 
-func (m *Mailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
+func (m *Mailbox) ListMessages(uid bool, seqsetRaw *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
+	// All messages sent to ch are considered to be a single response and
+	// go-imap writes responses one by one so channel should be closed
+	// before we can send updates in m.synchronize.
+	defer m.synchronize(uid)
 	defer close(ch)
 
-	errored := false
-	err := m.handle.Bolt.Update(func(btx *bbolt.Tx) error {
-		tx := m.handle.WithTransaction(btx)
-
-		seqset, err := m.resolveSeqSet(uid, *seqset)
+	shouldSetSeen := false
+	for _, item := range items {
+		sect, err := imap.ParseBodySectionName(item)
 		if err != nil {
-			if uid {
-				return nil
-			}
-			return err
+			continue
+		}
+		if !sect.Peek {
+			shouldSetSeen = true
+		}
+	}
+	if shouldSetSeen {
+		items = append(items, imap.FetchFlags)
+	}
+
+	btx, err := m.handle.Bolt.Begin(shouldSetSeen)
+	if err != nil {
+		m.error("ListMessages: tx start", err)
+		return errors.New("I/O error, try again later")
+	}
+	if shouldSetSeen {
+		defer btx.Commit()
+	} else {
+		defer btx.Rollback()
+	}
+	tx := m.handle.WithTransaction(btx)
+
+	seqset, err := m.resolveSeqSet(uid, *seqsetRaw)
+	if err != nil {
+		if uid {
+			return nil
+		}
+		return err
+	}
+
+	errored := false
+	err = tx.Select().OrderBy("UID").Each(new(message), func(rec interface{}) error {
+		msg := rec.(*message)
+
+		if !seqset.Contains(msg.UID) {
+			return nil
 		}
 
-		return tx.Select().OrderBy("UID").Each(new(message), func(rec interface{}) error {
-			msg := rec.(*message)
-
-			if !seqset.Contains(msg.UID) {
-				return nil
-			}
-
-			seq, ok := m.uidAsSeq(msg.UID)
-			if !ok {
-				m.error("ListMessages: BUG: uidToSeq failed for resolved seqset (uid %v)", nil, msg.UID)
-				errored = true
-				return nil
-			}
-
-			m.b.Debug.Println("ListMessages: fetching", items, "for", msg.UID)
-			if err := m.fetch(ch, seq, *msg, items); err != nil {
-				m.error("fetch", err)
-				errored = true
-				return nil
-			}
-
+		seq, ok := m.uidAsSeq(msg.UID)
+		if !ok {
+			m.error("ListMessages: BUG: uidToSeq failed for resolved seqset (uid %v)", nil, msg.UID)
+			errored = true
 			return nil
-		})
+		}
+
+		if shouldSetSeen {
+			// Errors here are not critical so we can disregard them
+			// without reporting to the client.
+			var flags messageFlags
+			if err := tx.One("UID", msg.UID, &flags); err != nil {
+				m.error("ListMessages: load flags", err)
+				return nil
+			}
+			flags.Flags = backendutil.UpdateFlags(flags.Flags, imap.AddFlags, []string{imap.SeenFlag})
+			msg.Unseen = false
+			if err := tx.Save(&flags); err != nil {
+				m.error("ListMessages: save flags", err)
+			}
+			if err := tx.Save(msg); err != nil {
+				m.error("ListMessages: save msg", err)
+			}
+		}
+
+		m.b.Debug.Println("ListMessages: fetching", items, "for", msg.UID)
+		if err := m.fetch(tx, ch, seq, *msg, items); err != nil {
+			m.error("fetch", err)
+			errored = true
+			return nil
+		}
+
+		return nil
 	})
 	if err != nil {
 		m.error("I/O error", err)
 		return err
 	}
-
-	m.synchronize(uid)
 
 	if errored {
 		return errors.New("Server-side error occured, partial results returned")
@@ -340,8 +396,110 @@ func (m *Mailbox) ListMessages(uid bool, seqset *imap.SeqSet, items []imap.Fetch
 	return nil
 }
 
+func searchNeedsBody(criteria *imap.SearchCriteria) bool {
+	if criteria.Header != nil ||
+		criteria.Body != nil ||
+		criteria.Text != nil ||
+		!criteria.SentSince.IsZero() ||
+		!criteria.SentBefore.IsZero() ||
+		criteria.Smaller != 0 ||
+		criteria.Larger != 0 {
+
+		return true
+	}
+
+	for _, crit := range criteria.Not {
+		if searchNeedsBody(crit) {
+			return true
+		}
+	}
+	for _, crit := range criteria.Or {
+		if searchNeedsBody(crit[0]) || searchNeedsBody(crit[1]) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (m *Mailbox) SearchMessages(uid bool, criteria *imap.SearchCriteria) ([]uint32, error) {
-	return nil, errors.New("imapmaildir: not implemented")
+	btx, err := m.handle.Bolt.Begin(false)
+	if err != nil {
+		m.error("SearchMessages: tx start", err)
+		return nil, errors.New("I/O error, try again later")
+	}
+	defer btx.Rollback()
+	tx := m.handle.WithTransaction(btx)
+
+	bodyNeeded := searchNeedsBody(criteria)
+	var result []uint32
+
+	err = tx.Select().OrderBy("UID").Each(new(message), func(rec interface{}) error {
+		msg := rec.(*message)
+
+		seq, ok := m.uidAsSeq(msg.UID)
+		if !ok {
+			m.error("SearchMessages: BUG: uidToSeq failed for resolved seqset (uid %v)", nil, msg.UID)
+			return nil
+		}
+
+		var (
+			info  messageInfo
+			flags messageFlags
+		)
+
+		if err := tx.One("UID", msg.UID, &info); err != nil {
+			m.error("SearchMessages: info query", err)
+			return nil
+		}
+		if err := tx.One("UID", msg.UID, &flags); err != nil {
+			m.error("SearchMessages: info query", err)
+			return nil
+		}
+
+		var entity *gomessage.Entity
+		if bodyNeeded {
+			path, err := m.dir.Filename(msg.key())
+			if err != nil {
+				m.error("SearchMessages: missing body file", err)
+				return nil
+			}
+			f, err := os.Open(path)
+			if err != nil {
+				m.error("SearchMessages", err)
+				return nil
+			}
+			defer f.Close()
+			entity, err = gomessage.Read(f)
+			if err != nil {
+				m.error("SearchMessages: entity read", err)
+				return nil
+			}
+		} else {
+			entity, _ = gomessage.New(gomessage.Header{}, nil)
+		}
+
+		match, err := backendutil.Match(entity, seq, msg.UID, info.InternalDate, flags.Flags, criteria)
+		if err != nil {
+			m.error("SearchMessages: match error", err)
+			return nil
+		}
+		if match {
+			if uid {
+				result = append(result, msg.UID)
+			} else {
+				result = append(result, seq)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		m.error("I/O error", err)
+		return nil, errors.New("I/O error, try again later")
+	}
+
+	return result, nil
 }
 
 func (m *Mailbox) temporaryMsgPath() string {
@@ -396,6 +554,7 @@ func (m *Mailbox) CreateMessage(flags []string, date time.Time, body imap.Litera
 		Unseen: true,
 	}
 	var info messageInfo
+
 	err = m.handle.Bolt.Update(func(btx *bbolt.Tx) error {
 		tx := m.handle.WithTransaction(btx)
 
@@ -434,6 +593,9 @@ func (m *Mailbox) CreateMessage(flags []string, date time.Time, body imap.Litera
 		}
 		mboxMeta.MsgsCount++
 		mboxMeta.UidNext = msg.UID + 1
+		for _, f := range flags {
+			mboxMeta.UsedFlags[f] += 1
+		}
 		if err := tx.Save(&mboxMeta); err != nil {
 			// TODO: Perhaps this should not fail and we can get away by having Status fix it?
 			return fmt.Errorf("CreateMessage %d: save mboxData: %w", msg.UID, err)
@@ -485,12 +647,38 @@ func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation i
 				return nil
 			}
 
+			var data mboxData
+			if err := tx.One("Dummy", 1, &data); err != nil {
+				m.error("UpdateMessagesFlags: fetch mbox data", err)
+				return errors.New("I/O error, try again later")
+			}
+			if data.UsedFlags != nil {
+				for _, f := range mFlags.Flags {
+					data.UsedFlags[f] -= 1
+				}
+			}
+
 			m.b.Debug.Println("UpdateMessageFlags: updating flags", msg.UID, mFlags.Flags, "op", operation, flags)
 			mFlags.Flags = backendutil.UpdateFlags(mFlags.Flags, operation, flags)
 			if err := tx.Save(&mFlags); err != nil {
 				m.error("UpdateMessagesFlags: save", err)
 				errored = true
 				return nil
+			}
+
+			if data.UsedFlags != nil {
+				for _, f := range mFlags.Flags {
+					data.UsedFlags[f] += 1
+				}
+			}
+			for flag, count := range data.UsedFlags {
+				if count <= 0 {
+					delete(data.UsedFlags, flag)
+				}
+			}
+			if err := tx.Save(&data); err != nil {
+				m.error("UpdateMessagesFlags: save mbox data", err)
+				return errors.New("I/O error, try again later")
 			}
 
 			hasSeen := false
@@ -593,7 +781,10 @@ func (m *Mailbox) CopyMessages(uid bool, seqsetRaw *imap.SeqSet, dest string) er
 		}
 	}
 
-	var newTgtUids []uint32
+	var (
+		newTgtUids  []uint32
+		copiedFlags = make(map[string]int)
+	)
 
 	// TODO: Avoid iterating all messages for UID queries.
 	q := txSrc.Select().OrderBy("UID")
@@ -657,6 +848,9 @@ func (m *Mailbox) CopyMessages(uid bool, seqsetRaw *imap.SeqSet, dest string) er
 		if err := txTgt.Save(&flags); err != nil {
 			return fmt.Errorf("CopyMessages %s, %d (tgt UID): flags save: %w", tgtMbox.name, msg.UID, err)
 		}
+		for _, f := range flags.Flags {
+			copiedFlags[f] += 1
+		}
 
 		if err := os.Link(srcName, tgtName); err != nil {
 			return fmt.Errorf("CopyMessages %s, %d (tgt UID): %w", tgtMbox.name, msg.UID, err)
@@ -683,6 +877,9 @@ func (m *Mailbox) CopyMessages(uid bool, seqsetRaw *imap.SeqSet, dest string) er
 		return errors.New("I/O error, try again later")
 	}
 	mboxInfo.MsgsCount += uint32(len(purgeList))
+	for f, count := range copiedFlags {
+		mboxInfo.UsedFlags[f] += count
+	}
 	if err := txTgt.Save(&mboxInfo); err != nil {
 		m.error("CopyMesages: target info save", err)
 		return errors.New("I/O error, try again later")

@@ -7,12 +7,13 @@ import (
 	"io"
 	"os"
 
+	"github.com/asdine/storm/v3"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/backend/backendutil"
 	"github.com/emersion/go-message/textproto"
 )
 
-func (m *Mailbox) fetch(ch chan<- *imap.Message, seqNum uint32, msg message, items []imap.FetchItem) error {
+func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, msg message, items []imap.FetchItem) error {
 	result := imap.NewMessage(seqNum, items)
 
 	var (
@@ -30,7 +31,7 @@ func (m *Mailbox) fetch(ch chan<- *imap.Message, seqNum uint32, msg message, ite
 			result.Uid = msg.UID
 		case imap.FetchFlags:
 			if flags.UID == 0 {
-				if err := m.handle.One("UID", msg.UID, &flags); err != nil {
+				if err := tx.One("UID", msg.UID, &flags); err != nil {
 					return fmt.Errorf("fetch: flags query: %w", err)
 				}
 				m.sanityCheckFlags(&msg, flags.Flags)
@@ -39,7 +40,7 @@ func (m *Mailbox) fetch(ch chan<- *imap.Message, seqNum uint32, msg message, ite
 			result.Flags = flags.Flags
 		case imap.FetchInternalDate:
 			if info.UID == 0 {
-				if err := m.handle.One("UID", msg.UID, &info); err != nil {
+				if err := tx.One("UID", msg.UID, &info); err != nil {
 					return fmt.Errorf("fetch: info query: %w", err)
 				}
 			}
@@ -47,14 +48,14 @@ func (m *Mailbox) fetch(ch chan<- *imap.Message, seqNum uint32, msg message, ite
 			result.InternalDate = info.InternalDate
 		case imap.FetchRFC822Size:
 			if info.UID == 0 {
-				if err := m.handle.One("UID", msg.UID, &info); err != nil {
+				if err := tx.One("UID", msg.UID, &info); err != nil {
 					return fmt.Errorf("fetch: info query: %w", err)
 				}
 			}
 			result.Size = info.RFC822Size
 		case imap.FetchEnvelope:
 			if cache.UID == 0 {
-				if err := m.handle.One("UID", msg.UID, &cache); err != nil {
+				if err := tx.One("UID", msg.UID, &cache); err != nil {
 					return fmt.Errorf("fetch: cache query: %w", err)
 				}
 			}
@@ -66,7 +67,7 @@ func (m *Mailbox) fetch(ch chan<- *imap.Message, seqNum uint32, msg message, ite
 			bodyItems = append(bodyItems, item)
 		case imap.FetchBodyStructure, imap.FetchBody:
 			if cache.UID == 0 {
-				if err := m.handle.One("UID", msg.UID, &cache); err != nil {
+				if err := tx.One("UID", msg.UID, &cache); err != nil {
 					return fmt.Errorf("fetch: cache query: %w", err)
 				}
 			}

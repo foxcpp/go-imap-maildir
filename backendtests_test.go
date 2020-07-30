@@ -42,5 +42,9 @@ func cleanBackend(b backendtests.Backend) {
 }
 
 func TestBackend(t *testing.T) {
+	backendtests.Blacklist = []string{
+		"TestBackend/User_DeleteMailbox_Parents",
+	}
+
 	backendtests.RunTests(t, initTestBackend, cleanBackend)
 }

@@ -57,14 +57,19 @@ func (u *User) SetSubscribed(mbox string, subscribed bool) error {
 	if err != nil {
 		return err
 	}
-	if !subscribed {
-		err = ioutil.WriteFile(filepath.Join(fsPath, "unsubscribed"), []byte{}, os.ModePerm)
-		if os.IsNotExist(err) {
-			return backend.ErrNoSuchMailbox
+	if subscribed {
+		err = ioutil.WriteFile(filepath.Join(fsPath, "subscribed"), []byte{}, os.ModePerm)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return backend.ErrNoSuchMailbox
+			}
+			u.b.Log.Printf("SetSubscribed: %v", err)
+			return errors.New("I/O error, try again later")
 		}
 	} else {
-		err = os.Remove(filepath.Join(fsPath, "unsubscribed"))
+		err = os.Remove(filepath.Join(fsPath, "subscribed"))
 		if err != nil && !os.IsNotExist(err) {
+			u.b.Log.Printf("SetSubscribed: %v", err)
 			return errors.New("I/O error, try again later")
 		}
 	}
@@ -86,16 +91,16 @@ func (u *User) prepareMboxPath(mbox string) (fsPath string, parts []string, err 
 	}
 
 	// Verify validity before attempting to do anything.
-	if len(parts) > MaxMboxNesting {
+	nameParts := strings.Split(mbox, HierarchySep)
+	if len(nameParts) > MaxMboxNesting {
 		return "", nil, errors.New("mailbox nesting limit exceeded")
 	}
 	fsPath = u.basePath
-	nameParts := strings.Split(mbox, HierarchySep)
 	for i, part := range nameParts {
 		if part == "" {
 			// Strip the possible trailing separator but not allow empty parts
 			// in general.
-			if i != len(parts)-1 {
+			if i != len(nameParts)-1 {
 				return "", nil, errors.New("illegal mailbox name")
 			}
 			continue
@@ -177,9 +182,9 @@ func (u *User) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
 		}
 
 		if subscribed {
-			_, err := os.Stat(filepath.Join(path, "unsubscribed"))
-			if err == nil {
-				return filepath.SkipDir
+			_, err := os.Stat(filepath.Join(path, "subscribed"))
+			if err != nil {
+				return nil
 			}
 		}
 
@@ -263,11 +268,12 @@ func (u *User) GetMailbox(mbox string, readOnly bool, conn backend.Conn) (*imap.
 		if err != storm.ErrNotFound {
 			return fmt.Errorf("read mboxData: %w", err)
 		}
-		u.b.Debug.Printf("initializing %s/%s", u.name, mbox)
 
 		data.Dummy = 1
 		data.UidNext = 1
 		data.UidValidity = uint32(time.Now().UnixNano() & 0xFFFFFFFF)
+		data.UsedFlags = make(map[string]int)
+		u.b.Debug.Printf("initializing %s/%s with uidvalidity %v", u.name, mbox, data.UidValidity)
 		if err := tx.Save(&data); err != nil {
 			return fmt.Errorf("save mboxData: %w", err)
 		}
@@ -282,6 +288,7 @@ func (u *User) GetMailbox(mbox string, readOnly bool, conn backend.Conn) (*imap.
 	u.b.Debug.Printf("get mbox (%v, %v)", mbox, fsPath)
 	mboxHandle := &Mailbox{
 		b:            u.b,
+		user:         u,
 		name:         mbox,
 		username:     u.name,
 		handle:       handle.db,
@@ -381,6 +388,16 @@ func (u *User) DeleteMailbox(mbox string) error {
 			return errors.New("I/O error")
 		}
 	}
+
+	u.b.dbsLock.Lock()
+	key := u.name + "\x00" + mbox
+	sharedHandle := u.b.dbs[key]
+	if sharedHandle != nil {
+		sharedHandle.db.Close()
+		delete(u.b.dbs, key)
+	}
+	u.b.dbsLock.Unlock()
+
 	// 2. Prevent new maildir deliveries.
 	if err := os.RemoveAll(filepath.Join(fsPath, "tmp")); err != nil {
 		if !os.IsNotExist(err) {
@@ -453,6 +470,15 @@ func (u *User) RenameMailbox(existingName, newName string) error {
 		// Index for INBOX might be uninitialized if it was never opened.
 		_ = os.Rename(filepath.Join(u.basePath, IndexFile), filepath.Join(fsPathNew, IndexFile))
 
+		u.b.dbsLock.Lock()
+		key := u.name + "\x00" + InboxName
+		sharedHandle := u.b.dbs[key]
+		if sharedHandle != nil {
+			sharedHandle.db.Close()
+			delete(u.b.dbs, key)
+		}
+		u.b.dbsLock.Unlock()
+
 		return nil
 	}
 
@@ -465,11 +491,19 @@ func (u *User) RenameMailbox(existingName, newName string) error {
 		return err
 	}
 
+	key := u.name + "\x00" + existingName
+	sharedHandle := u.b.dbs[key]
+	if sharedHandle != nil {
+		sharedHandle.db.Close()
+		delete(u.b.dbs, key)
+	}
+
 	if err := os.Rename(fsPathOld, fsPathNew); err != nil {
 		u.b.Log.Printf("failed to rename mailbox: %v", err)
 		return errors.New("I/O error")
 	}
 	u.b.Debug.Printf("rename mbox (%v, %v), (%v, %v)", existingName, fsPathOld, newName, fsPathNew)
+
 	return nil
 }
 

@@ -106,6 +106,12 @@ func (b *Backend) CreateUser(username string) error {
 		return errors.New("I/O error")
 	}
 
+	// INBOX is subscribed by default.
+	err = ioutil.WriteFile(filepath.Join(basePath, "subscribed"), []byte{}, 0700)
+	if err != nil {
+		return errors.New("I/O error")
+	}
+
 	return nil
 }
 
