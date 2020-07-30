@@ -36,9 +36,10 @@ type Backend struct {
 }
 
 type mailboxHandle struct {
-	db     *storm.DB
-	uses   int64
-	mboxes []*Mailbox
+	db         *storm.DB
+	uses       int64
+	mboxes     []*Mailbox
+	mboxesLock sync.RWMutex
 }
 
 type flagUpdate struct {

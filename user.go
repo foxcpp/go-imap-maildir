@@ -82,7 +82,8 @@ func (u *User) Status(name string, items []imap.StatusItem) (*imap.MailboxStatus
 		return nil, err
 	}
 	defer mbox.Close()
-	return mbox.(*Mailbox).Status(items)
+	_, _, status, err := mbox.(*Mailbox).status(items, false, false, false)
+	return status, err
 }
 
 func (u *User) prepareMboxPath(mbox string) (fsPath string, parts []string, err error) {
@@ -302,15 +303,19 @@ func (u *User) GetMailbox(mbox string, readOnly bool, conn backend.Conn) (*imap.
 		return nil, mboxHandle, nil
 	}
 
-	uidMap, status, err := mboxHandle.status([]imap.StatusItem{imap.StatusMessages, imap.StatusRecent,
-		imap.StatusUnseen, imap.StatusUidNext, imap.StatusUidValidity}, true)
+	uidMap, recent, status, err := mboxHandle.status([]imap.StatusItem{imap.StatusMessages, imap.StatusRecent,
+		imap.StatusUnseen, imap.StatusUidNext, imap.StatusUidValidity}, true, !readOnly, true)
 	if err != nil {
 		return nil, mboxHandle, err
 	}
 
+	handle.mboxesLock.Lock()
 	handle.mboxes = append(handle.mboxes, mboxHandle)
+	handle.mboxesLock.Unlock()
 
 	mboxHandle.uidMap = uidMap
+	mboxHandle.recentUIDs = recent
+	u.b.Debug.Printf("%d recent messages in %s", len(recent), mbox)
 	if len(uidMap) != 0 {
 		u.b.Debug.Printf("populated mailbox %s uidMap (len = %v, first = %v, last = %v)", mbox, len(uidMap), uidMap[0], uidMap[len(uidMap)-1])
 	} else {

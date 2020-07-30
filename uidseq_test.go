@@ -81,10 +81,15 @@ func TestUidToSeq(t *testing.T) {
 	test(imap.Seq{Start: 8, Stop: 8}, imap.Seq{Start: 5, Stop: 5}, false)
 	test(imap.Seq{Start: 3, Stop: 5}, imap.Seq{Start: 2, Stop: 2}, false)
 	test(imap.Seq{Start: 9, Stop: 10}, uselessSeq, true)
+	test(imap.Seq{Start: 9, Stop: 5}, uselessSeq, true)
 	test(imap.Seq{Start: 1, Stop: 1}, uselessSeq, true)
 
 	uidMap = []uint32{}
 	test(imap.Seq{Start: 1}, uselessSeq, true)
 	uidMap = []uint32{4}
 	test(imap.Seq{Start: 4, Stop: 4}, imap.Seq{Start: 1, Stop: 1}, false)
+
+	uidMap = []uint32{0, 2, 0, 4, 5, 6, 7, 8}
+	test(imap.Seq{Start: 2, Stop: 2}, imap.Seq{Start: 2, Stop: 2}, false)
+	test(imap.Seq{Start: 4, Stop: 4}, imap.Seq{Start: 4, Stop: 4}, false)
 }

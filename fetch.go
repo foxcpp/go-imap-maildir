@@ -13,7 +13,7 @@ import (
 	"github.com/emersion/go-message/textproto"
 )
 
-func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, msg message, items []imap.FetchItem) error {
+func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, msg message, items []imap.FetchItem, canUpdateCache bool) error {
 	result := imap.NewMessage(seqNum, items)
 
 	var (
@@ -42,6 +42,11 @@ func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, m
 			if !msg.Unseen {
 				flags.Flags = append(flags.Flags, imap.SeenFlag)
 			}
+
+			if m.isRecent(msg.UID) {
+				flags.Flags = append(flags.Flags, imap.RecentFlag)
+			}
+
 			result.Flags = flags.Flags
 		case imap.FetchInternalDate:
 			if info.UID == 0 {
@@ -87,6 +92,8 @@ func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, m
 			}
 			bodyItems = append(bodyItems, item)
 		default:
+			// TODO: Dynamically cache header subset like go-imap-sql does it
+			// (except it does it statically).
 			bodyItems = append(bodyItems, item)
 		}
 	}
@@ -96,10 +103,27 @@ func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, m
 		return fmt.Errorf("fetch: filename resolve: %w", err)
 	}
 
+	newCacheData := false
+
 	for _, item := range bodyItems {
 		err := m.fetchBodyItem(result, &header, filePath, item)
 		if err != nil {
 			return err
+		}
+
+		switch item {
+		case imap.FetchEnvelope:
+			cache.Envelope = result.Envelope
+			newCacheData = true
+		case imap.FetchBodyStructure:
+			cache.BodyStructure = result.BodyStructure
+			newCacheData = true
+		}
+	}
+
+	if newCacheData && canUpdateCache {
+		if err := tx.Save(&cache); err != nil {
+			m.error("fetch: cache update for %v", err, msg.UID)
 		}
 	}
 
