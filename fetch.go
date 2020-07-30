@@ -34,9 +34,14 @@ func (m *Mailbox) fetch(tx storm.Node, ch chan<- *imap.Message, seqNum uint32, m
 				if err := tx.One("UID", msg.UID, &flags); err != nil {
 					return fmt.Errorf("fetch: flags query: %w", err)
 				}
-				m.sanityCheckFlags(&msg, flags.Flags)
 			}
 			m.b.Debug.Println("fetch: loaded flags for uid", msg.UID, flags.Flags)
+			if msg.Deleted {
+				flags.Flags = append(flags.Flags, imap.DeletedFlag)
+			}
+			if !msg.Unseen {
+				flags.Flags = append(flags.Flags, imap.SeenFlag)
+			}
 			result.Flags = flags.Flags
 		case imap.FetchInternalDate:
 			if info.UID == 0 {
@@ -206,25 +211,4 @@ func stripExtBodyStruct(extended *imap.BodyStructure) *imap.BodyStructure {
 		stripped.Parts[i] = stripExtBodyStruct(stripped.Parts[i])
 	}
 	return &stripped
-}
-
-func (m *Mailbox) sanityCheckFlags(msg *message, flags []string) {
-	var (
-		hasSeen    = false
-		hasDeleted = false
-	)
-	for _, f := range flags {
-		if f == imap.DeletedFlag {
-			hasDeleted = true
-		}
-		if f == imap.SeenFlag {
-			hasSeen = true
-		}
-	}
-	if hasSeen != !msg.Unseen {
-		m.error("BUG: message-messageFlags mismatch, flags: %v, message: %+v", nil, flags, msg)
-	}
-	if hasDeleted != msg.Deleted {
-		m.error("BUG: message-messageFlags mismatch, flags: %v, message: %+v", nil, flags, msg)
-	}
 }

@@ -654,12 +654,32 @@ func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation i
 			}
 			if data.UsedFlags != nil {
 				for _, f := range mFlags.Flags {
+					if strings.HasPrefix(f, `\`) {
+						continue
+					}
 					data.UsedFlags[f] -= 1
 				}
 			}
 
 			m.b.Debug.Println("UpdateMessageFlags: updating flags", msg.UID, mFlags.Flags, "op", operation, flags)
 			mFlags.Flags = backendutil.UpdateFlags(mFlags.Flags, operation, flags)
+
+			hasSeen := false
+			hasDeleted := false
+			flags := mFlags.Flags[:0]
+			for _, f := range mFlags.Flags {
+				if f == imap.SeenFlag {
+					hasSeen = true
+					continue
+				}
+				if f == imap.DeletedFlag {
+					hasDeleted = true
+					continue
+				}
+				flags = append(flags, f)
+			}
+			mFlags.Flags = flags
+
 			if err := tx.Save(&mFlags); err != nil {
 				m.error("UpdateMessagesFlags: save", err)
 				errored = true
@@ -668,6 +688,9 @@ func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation i
 
 			if data.UsedFlags != nil {
 				for _, f := range mFlags.Flags {
+					if strings.HasPrefix(f, `\`) {
+						continue
+					}
 					data.UsedFlags[f] += 1
 				}
 			}
@@ -681,16 +704,6 @@ func (m *Mailbox) UpdateMessagesFlags(uid bool, seqset *imap.SeqSet, operation i
 				return errors.New("I/O error, try again later")
 			}
 
-			hasSeen := false
-			hasDeleted := false
-			for _, f := range mFlags.Flags {
-				if f == imap.SeenFlag {
-					hasSeen = true
-				}
-				if f == imap.DeletedFlag {
-					hasDeleted = true
-				}
-			}
 			msg.Unseen = !hasSeen
 			msg.Deleted = hasDeleted
 			if err := tx.Save(msg); err != nil {
