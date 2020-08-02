@@ -30,10 +30,13 @@ github.com/emersion/go-textwrapper v0.0.0-20160606182133-d0e65e56babe h1:40SWqY0
 github.com/emersion/go-textwrapper v0.0.0-20160606182133-d0e65e56babe/go.mod h1:aqO8z8wPrjkscevZJFVE1wXJrLpC5LtJG7fqLOsPb2U=
 github.com/foxcpp/go-imap v1.0.0-beta.1.0.20200726203712-b88370e55f2f h1:4AGE952cAr1ach5zXqDX7t4Q5jUWcPverTsdPBHTca4=
 github.com/foxcpp/go-imap v1.0.0-beta.1.0.20200726203712-b88370e55f2f/go.mod h1:yKASt+C3ZiDAiCSssxg9caIckWF/JG7ZQTO7GAmvicU=
+github.com/foxcpp/go-imap v1.0.0-beta.1.0.20200802083659-cf943ff91d80 h1:c66xbEXsb/aPZTSrf430FhPGhE3s6wJtCE8BszYOsdY=
+github.com/foxcpp/go-imap v1.0.0-beta.1.0.20200802083659-cf943ff91d80/go.mod h1:yKASt+C3ZiDAiCSssxg9caIckWF/JG7ZQTO7GAmvicU=
 github.com/foxcpp/go-imap-backend-tests v0.0.0-20200104150404-bd7815ad9f5a h1:0M1igChqRDhGcWrjuAq+BiYC7CdVCsyktmbKWlJeuuo=
 github.com/foxcpp/go-imap-backend-tests v0.0.0-20200104150404-bd7815ad9f5a/go.mod h1:yUISYv/uXLQ6tQZcds/p/hdcZ5JzrEUifyED2VffWpc=
 github.com/foxcpp/go-imap-backend-tests v0.0.0-20200616221226-85255dc9f40f h1:vKaWiNDR2dR6qyF/9zjot5Q3ghOEw9Fmj0ltYvBkCwM=
 github.com/foxcpp/go-imap-backend-tests v0.0.0-20200616221226-85255dc9f40f/go.mod h1:yUISYv/uXLQ6tQZcds/p/hdcZ5JzrEUifyED2VffWpc=
+github.com/foxcpp/go-imap-backend-tests v0.0.0-20200802090154-7e6248c85a0e/go.mod h1:dWepYGUClcebWyUy7yl8wm2ioE6NC4m82Xy/hDAng1c=
 github.com/golang/protobuf v1.3.1/go.mod h1:6lQm79b+lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=
 github.com/golang/protobuf v1.3.2/go.mod h1:6lQm79b+lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=
 github.com/golang/snappy v0.0.1/go.mod h1:/XxbfmMg8lxefKM7IXC3fBNl/7bRcc72aCRzEWrmP2Q=
